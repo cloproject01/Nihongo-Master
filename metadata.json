@@ -1,0 +1,7 @@
+{
+  "name": "Nihongo Master Clo",
+  "description": "Platform pembelajaran bahasa Jepang terstruktur berbasis level JLPT (N4-N1), dengan latihan adaptif bertenaga AI untuk pelajar di setiap tingkat keahlian. A structured Japanese language learning platform based on JLPT levels (N4-N1), featuring adaptive, AI-powered practice for students at every skill level.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
