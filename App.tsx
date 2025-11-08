@@ -4,8 +4,7 @@ import { Spinner } from './components/Spinner';
 import type { JlptLevel, ChatMessage, EbookChapter } from './types';
 import { getAiRoleplayResponse, getTextToSpeechAudio, getIndonesianGuidanceAudio } from './services/geminiService';
 
-// --- DATA CONSTANTS ---
-
+// Mock Data for the app
 const MOCK_LEVELS: JlptLevel[] = [
     { id: 'N4', name: 'N4', title: 'Dasar-Dasar Fundamental', description: 'Kuasai percakapan sehari-hari dan tata bahasa esensial.', kanjiCount: 300, vocabCount: 1500, progress: 100, unlocked: true, icon: <BookOpen /> },
     { id: 'N3', name: 'N3', title: 'Jembatan Menengah', description: 'Pahami artikel sehari-hari dan ikuti percakapan.', kanjiCount: 650, vocabCount: 3750, progress: 0, unlocked: false, icon: <MessageSquare /> },
@@ -50,6 +49,7 @@ const MOCK_CONTENT = {
             { ja: 'せんせいにほめられました。', id: 'Saya dipuji oleh guru.' }
         ]
     },
+    // N2 and N1 would have similar structures
 };
 
 const MOCK_EBOOK_CONTENT: { [key: string]: EbookChapter[] } = {
@@ -123,6 +123,7 @@ const ALPHABET_CARD: JlptLevel = {
     icon: <BookMarked />
 };
 
+// Stroke order guides for the first 5 characters of Hiragana and Katakana as examples
 const STROKE_ORDER_GUIDES: { [key: string]: React.ReactElement } = {
     'あ': (
         <svg viewBox="0 0 100 100">
@@ -173,47 +174,316 @@ const STROKE_ORDER_GUIDES: { [key: string]: React.ReactElement } = {
     ),
 };
 
-// --- HELPER FUNCTIONS ---
 
+// Helper function to decode raw PCM audio data from Gemini API
 async function decodeRawAudioData(
     audioContext: AudioContext,
     rawPcmData: ArrayBuffer
 ): Promise<AudioBuffer> {
-    const sampleRate = 24000;
-    const numChannels = 1;
+    const sampleRate = 24000; // Gemini TTS API returns audio at 24000 Hz
+    const numChannels = 1;     // Mono audio
+    
+    // The raw data is 16-bit signed integers (PCM S16LE)
     const dataInt16 = new Int16Array(rawPcmData);
     const frameCount = dataInt16.length / numChannels;
-    const audioBuffer = audioContext.createBuffer(numChannels, frameCount, sampleRate);
+    
+    const audioBuffer = audioContext.createBuffer(
+        numChannels,
+        frameCount,
+        sampleRate
+    );
     
     for (let channel = 0; channel < numChannels; channel++) {
         const channelData = audioBuffer.getChannelData(channel);
         for (let i = 0; i < frameCount; i++) {
+            // Convert the 16-bit integer to a float between -1.0 and 1.0, which Web Audio API expects
             channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
         }
     }
+    
     return audioBuffer;
 }
-
-// --- REUSABLE COMPONENTS (MEMOIZED FOR PERFORMANCE) ---
 
 const HelpButton: React.FC<{
     guidanceText: string;
     onSpeak: (text: string) => void;
     isSpeaking: boolean;
     speakingText: string | null;
-}> = React.memo(({ guidanceText, onSpeak, isSpeaking, speakingText }) => {
+}> = ({ guidanceText, onSpeak, isSpeaking, speakingText }) => {
     const isCurrentlySpeaking = isSpeaking && speakingText === guidanceText;
     return (
         <button
             onClick={() => onSpeak(guidanceText)}
             disabled={isSpeaking}
-            aria-label="Dengarkan panduan untuk bagian ini"
+            aria-label={`Dengarkan panduan untuk bagian ini`}
             className="inline-flex items-center justify-center text-gray-500 hover:text-purple-400 p-1 rounded-full hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 disabled:cursor-wait ml-2"
         >
             {isCurrentlySpeaking ? <Spinner className="w-4 h-4" /> : <HelpCircle className="w-4 h-4" />}
         </button>
     );
-});
+};
+
+
+const App: React.FC = () => {
+    const [levels, setLevels] = useState<JlptLevel[]>(MOCK_LEVELS);
+    const [selectedLevel, setSelectedLevel] = useState<JlptLevel | null>(null);
+    const [viewingAlphabet, setViewingAlphabet] = useState(false);
+    const [practicingChar, setPracticingChar] = useState<string | null>(null);
+    const [isSpeakingContent, setIsSpeakingContent] = useState(false);
+    const [speakingContentText, setSpeakingContentText] = useState<string | null>(null);
+    const [isSpeakingGuidance, setIsSpeakingGuidance] = useState(false);
+    const [speakingGuidanceText, setSpeakingGuidanceText] = useState<string | null>(null);
+    const audioContextRef = useRef<AudioContext | null>(null);
+
+    useEffect(() => {
+        // Initialize AudioContext. It's best to create it once.
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        return () => {
+          audioContextRef.current?.close();
+        }
+    }, []);
+
+    const speakContent = useCallback(async (text: string) => {
+        if (isSpeakingContent || isSpeakingGuidance || !text || !audioContextRef.current) return;
+
+        // Clean text to prevent API errors. 
+        const cleanTextForSpeech = text.split('\n')[0].replace(/\s*\(.*?\)\s*/g, '').trim();
+
+        if (!cleanTextForSpeech) {
+            console.warn("Skipping TTS for empty text after cleaning. Original:", text);
+            return;
+        }
+
+        // FIX: If the text is a single character (likely a Kanji), wrap it in a 
+        // descriptive sentence to provide context for the TTS API.
+        let textToSendToApi = cleanTextForSpeech;
+        if (cleanTextForSpeech.length === 1) {
+            textToSendToApi = `「${cleanTextForSpeech}」と読みます。`; // "It is read as [character]."
+        }
+
+        const audioContext = audioContextRef.current;
+        setSpeakingContentText(text); // Use original text to identify which button is active in the UI
+        setIsSpeakingContent(true);
+
+        try {
+            const base64Audio = await getTextToSpeechAudio(textToSendToApi);
+            const binaryString = window.atob(base64Audio);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            const audioBuffer = await decodeRawAudioData(audioContext, bytes.buffer);
+
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+            source.start(0);
+            
+            source.onended = () => {
+               setIsSpeakingContent(false);
+               setSpeakingContentText(null);
+            };
+        } catch (error) {
+            console.error("Error playing audio:", error);
+            if (error instanceof Error && error.message.includes("No audio data returned")) {
+                console.error(`TTS API likely failed for text: "${textToSendToApi}"`);
+            }
+            setIsSpeakingContent(false);
+            setSpeakingContentText(null);
+        }
+    }, [isSpeakingContent, isSpeakingGuidance]);
+
+    const speakGuidance = useCallback(async (text: string) => {
+        if (isSpeakingContent || isSpeakingGuidance || !text || !audioContextRef.current) return;
+
+        const audioContext = audioContextRef.current;
+        setSpeakingGuidanceText(text);
+        setIsSpeakingGuidance(true);
+
+        try {
+            const base64Audio = await getIndonesianGuidanceAudio(text);
+            const binaryString = window.atob(base64Audio);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            
+            const audioBuffer = await decodeRawAudioData(audioContext, bytes.buffer);
+
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+            source.start(0);
+            
+            source.onended = () => {
+               setIsSpeakingGuidance(false);
+               setSpeakingGuidanceText(null);
+            };
+        } catch (error) {
+            console.error("Error playing guidance audio:", error);
+            setIsSpeakingGuidance(false);
+            setSpeakingGuidanceText(null);
+        }
+    }, [isSpeakingContent, isSpeakingGuidance]);
+
+
+    const handleSelectLevel = (level: JlptLevel) => {
+        if (level.unlocked) {
+            setSelectedLevel(level);
+        }
+    };
+
+    const handleUnlockNextLevel = () => {
+        const currentIndex = levels.findIndex(l => l.id === selectedLevel?.id);
+        if (currentIndex !== -1 && currentIndex < levels.length - 1) {
+            const nextLevelIndex = currentIndex + 1;
+            if (!levels[nextLevelIndex].unlocked) {
+                const updatedLevels = [...levels];
+                updatedLevels[nextLevelIndex].unlocked = true;
+                updatedLevels[currentIndex].progress = 100; // Mark current level as complete
+                setLevels(updatedLevels);
+                alert(`${levels[nextLevelIndex].name} Terbuka! Anda sekarang dapat mengakses level berikutnya.`);
+            }
+        }
+    };
+
+    const renderContent = () => {
+        if (practicingChar) {
+            return <WritingPracticeView
+                character={practicingChar}
+                onBack={() => setPracticingChar(null)}
+                onSpeakGuidance={speakGuidance}
+                isSpeakingGuidance={isSpeakingGuidance}
+                speakingGuidanceText={speakingGuidanceText}
+            />
+        }
+        if (viewingAlphabet) {
+            return <AlphabetView 
+                onBack={() => setViewingAlphabet(false)}
+                onSpeak={speakContent}
+                isSpeaking={isSpeakingContent}
+                speakingText={speakingContentText}
+                onStartPractice={(char) => setPracticingChar(char)}
+                onSpeakGuidance={speakGuidance}
+                isSpeakingGuidance={isSpeakingGuidance}
+                speakingGuidanceText={speakingGuidanceText}
+            />;
+        }
+        if (selectedLevel) {
+            return <LevelView 
+                level={selectedLevel} 
+                onBack={() => setSelectedLevel(null)}
+                onUnlockNextLevel={handleUnlockNextLevel}
+                onSpeak={speakContent}
+                isSpeaking={isSpeakingContent}
+                speakingText={speakingContentText}
+                onSpeakGuidance={speakGuidance}
+                isSpeakingGuidance={isSpeakingGuidance}
+                speakingGuidanceText={speakingGuidanceText}
+            />;
+        }
+        return <Dashboard 
+            levels={levels} 
+            onSelectLevel={handleSelectLevel}
+            onSelectAlphabet={() => setViewingAlphabet(true)}
+            onSpeakGuidance={speakGuidance}
+            isSpeakingGuidance={isSpeakingGuidance}
+            speakingGuidanceText={speakingGuidanceText}
+        />;
+    };
+
+    return (
+        <div className="min-h-screen bg-gray-900 text-gray-100 font-sans p-4 sm:p-6 lg:p-8 transition-all duration-500">
+            {/* SVG definitions for stroke order markers */}
+            <svg width="0" height="0" style={{position: 'absolute'}}>
+                <defs>
+                    <marker id="arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="3" markerHeight="3" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+                    </marker>
+                </defs>
+            </svg>
+            <main className="max-w-7xl mx-auto">
+                <header className="text-center mb-12">
+                    <h1 className="text-5xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-pink-400 to-purple-500">
+                        Nihongo Master
+                    </h1>
+                    <p className="mt-2 text-lg text-gray-400">Perjalanan Anda menuju kefasihan berbahasa Jepang dengan dukungan AI.</p>
+                </header>
+                {renderContent()}
+            </main>
+        </div>
+    );
+};
+
+const Dashboard: React.FC<{ 
+    levels: JlptLevel[], 
+    onSelectLevel: (level: JlptLevel) => void,
+    onSelectAlphabet: () => void,
+    onSpeakGuidance: (text: string) => void,
+    isSpeakingGuidance: boolean,
+    speakingGuidanceText: string | null
+}> = ({ levels, onSelectLevel, onSelectAlphabet, onSpeakGuidance, isSpeakingGuidance, speakingGuidanceText }) => {
+    const guidanceText = "Selamat datang di Nihongo Master. Pilih level untuk mulai belajar, atau mulailah dengan alfabet jika Anda baru. Level yang terkunci akan terbuka setelah Anda menyelesaikan level sebelumnya.";
+    const allCards = [ALPHABET_CARD, ...levels];
+    
+    return (
+        <>
+            <div className="flex justify-center items-center mb-8">
+                <h2 className="text-2xl font-semibold text-gray-300">Pilih Level Anda</h2>
+                <HelpButton 
+                    guidanceText={guidanceText}
+                    onSpeak={onSpeakGuidance}
+                    isSpeaking={isSpeakingGuidance}
+                    speakingText={speakingGuidanceText}
+                />
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+                {allCards.map(level => (
+                    <div key={level.id}
+                        onClick={() => level.id === 'ALPHABET' ? onSelectAlphabet() : onSelectLevel(level)}
+                        className={`group relative rounded-2xl p-6 border border-white/10 bg-gray-800/50 backdrop-blur-sm shadow-2xl transition-all duration-300 ease-in-out transform hover:-translate-y-2 ${level.unlocked ? 'cursor-pointer hover:border-pink-400/50 hover:shadow-pink-500/10' : 'cursor-not-allowed'}`}
+                    >
+                        {!level.unlocked && <div className="absolute inset-0 bg-black/60 rounded-2xl flex items-center justify-center z-10"><Lock className="w-10 h-10 text-gray-500"/></div>}
+                        <div className="flex justify-between items-start">
+                            <div className={`text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-br from-gray-200 to-gray-500 ${level.unlocked && 'group-hover:from-pink-400 group-hover:to-purple-500'}`}>{level.name}</div>
+                            <div className="text-purple-400">{level.icon}</div>
+                        </div>
+                        <h3 className="mt-4 text-xl font-semibold text-white">{level.title}</h3>
+                        <p className="mt-1 text-sm text-gray-400 h-10">{level.description}</p>
+                        <div className="mt-4 space-y-2 text-xs text-gray-300">
+                           {level.id !== 'ALPHABET' ? (
+                                <>
+                                    <p>Kanji: ~{level.kanjiCount}</p>
+                                    <p>Kosakata: ~{level.vocabCount}</p>
+                                </>
+                           ) : (
+                                <p>Total Karakter: {level.vocabCount}</p>
+                           )}
+                        </div>
+                        <div className="w-full bg-gray-700 rounded-full h-2.5 mt-6">
+                            <div className="bg-gradient-to-r from-pink-500 to-purple-600 h-2.5 rounded-full" style={{ width: `${level.progress}%` }}></div>
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </>
+    )
+};
+
+interface LevelViewProps {
+    level: JlptLevel;
+    onBack: () => void;
+    onUnlockNextLevel: () => void;
+    onSpeak: (text: string) => void;
+    isSpeaking: boolean;
+    speakingText: string | null;
+    onSpeakGuidance: (text: string) => void;
+    isSpeakingGuidance: boolean;
+    speakingGuidanceText: string | null;
+}
 
 const TabContentHeader: React.FC<{
     title: string;
@@ -221,7 +491,7 @@ const TabContentHeader: React.FC<{
     onSpeakGuidance: (text: string) => void;
     isSpeakingGuidance: boolean;
     speakingGuidanceText: string | null;
-}> = React.memo(({ title, guidanceText, onSpeakGuidance, isSpeakingGuidance, speakingGuidanceText }) => (
+}> = ({ title, guidanceText, onSpeakGuidance, isSpeakingGuidance, speakingGuidanceText }) => (
     <div className="flex items-center mb-4">
         <h3 className="text-2xl font-semibold text-gray-200">{title}</h3>
         <HelpButton 
@@ -231,72 +501,202 @@ const TabContentHeader: React.FC<{
             speakingText={speakingGuidanceText}
         />
     </div>
-));
+);
 
-interface ContentGridProps {
-    items: string[];
-    onSelect: (item: string) => void;
+const AlphabetView: React.FC<{
+    onBack: () => void;
     onSpeak: (text: string) => void;
     isSpeaking: boolean;
     speakingText: string | null;
-}
+    onStartPractice: (character: string) => void;
+    onSpeakGuidance: (text: string) => void;
+    isSpeakingGuidance: boolean;
+    speakingGuidanceText: string | null;
+}> = ({ onBack, onSpeak, isSpeaking, speakingText, onStartPractice, onSpeakGuidance, isSpeakingGuidance, speakingGuidanceText }) => {
+    const [activeTab, setActiveTab] = useState('Hiragana');
+    const tabs = ['Hiragana', 'Katakana'];
+    const alphabetGuidanceText = "Ini adalah halaman untuk belajar alfabet Jepang. Pilih antara Hiragana atau Katakana, lalu klik sebuah karakter untuk berlatih menulisnya, atau klik ikon speaker untuk mendengar suaranya.";
+    const tabGuidance = {
+        Hiragana: "Hiragana digunakan untuk kata-kata asli Jepang, partikel tata bahasa, dan akhiran kata kerja. Ini adalah sistem penulisan pertama yang harus dipelajari.",
+        Katakana: "Katakana digunakan untuk kata-kata serapan dari bahasa asing, nama asing, dan untuk penekanan. Karakternya lebih bersudut daripada Hiragana."
+    };
 
-const ContentGrid: React.FC<ContentGridProps> = React.memo(({items, onSelect, onSpeak, isSpeaking, speakingText}) => (
-    <div className="grid grid-cols-5 sm:grid-cols-8 md:grid-cols-10 gap-3">
-        {items.map((item, i) => {
-            const isCurrentlySpeaking = isSpeaking && speakingText === item;
-            return (
-                 <div key={i} className="relative group bg-gray-900 aspect-square rounded-lg transition-all duration-200 hover:bg-gray-700 focus-within:ring-2 focus-within:ring-purple-500 hover:-translate-y-1">
-                    <button 
-                        onClick={() => onSelect(item)} 
-                        aria-label={`Berlatih menulis ${item}`}
-                        className="w-full h-full flex items-center justify-center text-3xl sm:text-4xl font-bold"
-                    >
-                        {item}
-                    </button>
-                    <button
-                        onClick={(e) => { e.stopPropagation(); onSpeak(item); }}
-                        disabled={isSpeaking}
-                        aria-label={`Ucapkan ${item}`}
-                        className="absolute bottom-1 right-1 text-gray-500 hover:text-white p-1 rounded-full hover:bg-gray-800/50 transition-all opacity-50 group-hover:opacity-100 focus:opacity-100 disabled:opacity-50 disabled:cursor-wait"
-                    >
-                       {isCurrentlySpeaking ? <Spinner className="w-4 h-4" /> : <SpeakerIcon className="w-4 h-4"/>}
-                    </button>
-                </div>
-            )
-        })}
-    </div>
-));
-
-const ContentList: React.FC<{
-    items: string[];
-    onSpeak: (text: string) => void;
-    isSpeaking: boolean;
-    speakingText: string | null;
-}> = React.memo(({items, onSpeak, isSpeaking, speakingText}) => {
     return (
-     <ul className="space-y-3">
-        {items.map((item, i) => {
-             const isCurrentlySpeaking = isSpeaking && speakingText === item;
-             return (
-                 <li key={i} className="bg-gray-900 p-4 rounded-lg text-gray-300 flex justify-between items-center">
-                    <span>{item}</span>
-                    <button 
-                        onClick={() => onSpeak(item)}
-                        disabled={isSpeaking}
-                        aria-label={`Ucapkan ${item}`} 
-                        className="text-gray-400 hover:text-white p-2 rounded-full hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 disabled:cursor-wait"
-                    >
-                        {isCurrentlySpeaking ? <Spinner /> : <SpeakerIcon className="w-5 h-5"/>}
-                    </button>
-                </li>
-             )
-        })}
-    </ul>
-    );
-});
+        <div className="bg-gray-800/50 border border-white/10 rounded-2xl p-4 sm:p-8 shadow-2xl">
+            <button onClick={onBack} className="flex items-center gap-2 mb-6 text-gray-400 hover:text-white transition-colors">
+                <ChevronLeft /> Kembali ke Dasbor
+            </button>
+            <div className="flex items-center mb-6">
+                <h2 className="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-pink-400 to-purple-500">Dasar-Dasar Alfabet</h2>
+                <HelpButton 
+                    guidanceText={alphabetGuidanceText}
+                    onSpeak={onSpeakGuidance}
+                    isSpeaking={isSpeakingGuidance}
+                    speakingText={speakingGuidanceText}
+                />
+            </div>
+            
+            <div className="border-b border-gray-700">
+                <nav className="-mb-px flex space-x-8" aria-label="Tabs">
+                    {tabs.map(tab => (
+                        <button key={tab} onClick={() => setActiveTab(tab)}
+                            className={`${activeTab === tab ? 'border-purple-400 text-purple-400' : 'border-transparent text-gray-400 hover:text-gray-200 hover:border-gray-500'}
+                            whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition-colors`}>
+                            {tab}
+                        </button>
+                    ))}
+                </nav>
+            </div>
 
-const DrawingCanvas = React.memo(React.forwardRef<
+            <div className="py-6 min-h-[400px]">
+                <TabContentHeader 
+                    title={activeTab} 
+                    guidanceText={tabGuidance[activeTab as keyof typeof tabGuidance]}
+                    onSpeakGuidance={onSpeakGuidance}
+                    isSpeakingGuidance={isSpeakingGuidance}
+                    speakingGuidanceText={speakingGuidanceText}
+                />
+                {activeTab === 'Hiragana' && <ContentGrid items={HIRAGANA_CHARS} onSelect={onStartPractice} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
+                {activeTab === 'Katakana' && <ContentGrid items={KATAKANA_CHARS} onSelect={onStartPractice} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
+            </div>
+        </div>
+    );
+};
+
+const LevelView: React.FC<LevelViewProps> = ({ 
+    level, 
+    onBack, 
+    onUnlockNextLevel, 
+    onSpeak, 
+    isSpeaking, 
+    speakingText,
+    onSpeakGuidance,
+    isSpeakingGuidance,
+    speakingGuidanceText 
+}) => {
+    const [activeTab, setActiveTab] = useState('Kanji');
+    const content = MOCK_CONTENT[level.id as keyof typeof MOCK_CONTENT] || MOCK_CONTENT.N4;
+    const ebookContent = MOCK_EBOOK_CONTENT[level.id as keyof typeof MOCK_EBOOK_CONTENT] || [];
+    const tabs = ['Kanji', 'Kosakata', 'Tata Bahasa', 'Susun Kalimat', 'E-Book', 'Latihan AI'];
+    
+    const levelGuidanceText = `Ini adalah halaman belajar untuk level ${level.name}. Jelajahi kanji, kosakata, tata bahasa, baca e-book, atau berlatih percakapan dengan AI menggunakan tab di bawah.`;
+    const tabGuidance = {
+        Kanji: "Di sini Anda dapat melihat dan mendengarkan pengucapan karakter Kanji untuk level ini. Klik pada sebuah karakter untuk mendengarnya.",
+        Kosakata: "Pelajari daftar kosakata penting untuk level ini. Klik ikon speaker untuk mendengarkan pengucapannya.",
+        'Tata Bahasa': "Pahami pola tata bahasa kunci yang akan Anda gunakan di level ini. Klik ikon speaker untuk mendengarkan contoh kalimat.",
+        'Susun Kalimat': "Latih pemahaman tata bahasa Anda. Baca arti kalimatnya, lalu klik kata-kata Jepang yang diacak untuk menyusunnya. Jika Anda kesulitan, gunakan tombol 'Minta Bantuan' untuk mendapatkan petunjuk kata berikutnya.",
+        'E-Book': "Baca materi pembelajaran mendalam. Pilih bab dari daftar isi di sebelah kiri untuk mulai membaca.",
+        'Latihan AI': "Berlatih percakapan dengan AI. Pilih skenario, mulai, dan balas pesannya dalam bahasa Jepang atau Indonesia."
+    };
+
+    return (
+        <div className="bg-gray-800/50 border border-white/10 rounded-2xl p-4 sm:p-8 shadow-2xl">
+            <button onClick={onBack} className="flex items-center gap-2 mb-6 text-gray-400 hover:text-white transition-colors">
+                <ChevronLeft /> Kembali ke Dasbor
+            </button>
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6">
+                <div>
+                    <div className="flex items-center">
+                        <h2 className="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-pink-400 to-purple-500">{level.name}: {level.title}</h2>
+                        <HelpButton 
+                            guidanceText={levelGuidanceText}
+                            onSpeak={onSpeakGuidance}
+                            isSpeaking={isSpeakingGuidance}
+                            speakingText={speakingGuidanceText}
+                        />
+                    </div>
+                    <p className="text-gray-400 mt-1">{level.description}</p>
+                </div>
+                 {level.progress < 100 && (
+                     <button onClick={onUnlockNextLevel} className="mt-4 md:mt-0 bg-gradient-to-r from-pink-500 to-purple-600 text-white font-semibold px-6 py-2 rounded-lg shadow-lg hover:scale-105 transition-transform">
+                         Ambil Tes Diagnostik
+                     </button>
+                 )}
+            </div>
+
+            <div className="border-b border-gray-700">
+                <nav className="-mb-px flex space-x-8 overflow-x-auto" aria-label="Tabs">
+                    {tabs.map(tab => (
+                        <button key={tab} onClick={() => setActiveTab(tab)}
+                            className={`${activeTab === tab ? 'border-purple-400 text-purple-400' : 'border-transparent text-gray-400 hover:text-gray-200 hover:border-gray-500'}
+                            whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition-colors`}>
+                            {tab}
+                        </button>
+                    ))}
+                </nav>
+            </div>
+
+            <div className="py-6 min-h-[400px]">
+                <TabContentHeader 
+                    title={activeTab} 
+                    guidanceText={tabGuidance[activeTab as keyof typeof tabGuidance]}
+                    onSpeakGuidance={onSpeakGuidance}
+                    isSpeakingGuidance={isSpeakingGuidance}
+                    speakingGuidanceText={speakingGuidanceText}
+                />
+                {activeTab === 'Kanji' && <ContentGrid items={content.kanji} onSelect={(item) => onSpeak(item)} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
+                {activeTab === 'Kosakata' && <ContentList items={content.vocab} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
+                {activeTab === 'Tata Bahasa' && <ContentList items={content.grammar} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
+                {activeTab === 'Susun Kalimat' && <SentenceBuilder sentences={content.sentences} />}
+                {activeTab === 'E-Book' && <EbookReader content={ebookContent} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
+                {activeTab === 'Latihan AI' && <AiRoleplay level={level} scenarios={content.scenarios} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
+            </div>
+        </div>
+    );
+};
+
+const WritingPracticeView: React.FC<{
+    character: string;
+    onBack: () => void;
+    onSpeakGuidance: (text: string) => void;
+    isSpeakingGuidance: boolean;
+    speakingGuidanceText: string | null;
+}> = ({ character, onBack, onSpeakGuidance, isSpeakingGuidance, speakingGuidanceText }) => {
+    const canvasRef = useRef<{ clearCanvas: () => void }>(null);
+    const guidanceText = "Ini adalah mode latihan menulis. Lihat panduan urutan goresan di sebelah kiri. Gunakan mouse atau jari Anda untuk menulis karakter di kanvas sebelah kanan. Klik 'Bersihkan' untuk mencoba lagi.";
+    const strokeGuide = STROKE_ORDER_GUIDES[character];
+
+    return (
+        <div className="bg-gray-800/50 border border-white/10 rounded-2xl p-4 sm:p-8 shadow-2xl">
+            <button onClick={onBack} className="flex items-center gap-2 mb-6 text-gray-400 hover:text-white transition-colors">
+                <ChevronLeft /> Kembali ke Alfabet
+            </button>
+            <div className="flex items-center mb-6">
+                <h2 className="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-pink-400 to-purple-500">Latihan Menulis: {character}</h2>
+                <HelpButton
+                    guidanceText={guidanceText}
+                    onSpeak={onSpeakGuidance}
+                    isSpeaking={isSpeakingGuidance}
+                    speakingText={speakingGuidanceText}
+                />
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div>
+                    <h3 className="text-xl font-semibold mb-2 text-gray-300">Panduan Goresan</h3>
+                    <div className="aspect-square bg-gray-900 rounded-lg p-4 text-white">
+                        {strokeGuide ? strokeGuide : <p className="text-center text-gray-500 h-full flex items-center justify-center">Panduan untuk karakter ini belum tersedia.</p>}
+                    </div>
+                </div>
+                <div>
+                    <div className="flex justify-between items-center mb-2">
+                        <h3 className="text-xl font-semibold text-gray-300">Kanvas Latihan</h3>
+                        <button 
+                            onClick={() => canvasRef.current?.clearCanvas()}
+                            className="bg-gray-700 hover:bg-gray-600 text-white font-semibold px-4 py-1 rounded-lg transition-colors text-sm"
+                        >
+                            Bersihkan
+                        </button>
+                    </div>
+                    <div className="aspect-square rounded-lg overflow-hidden border-2 border-gray-700">
+                        <DrawingCanvas ref={canvasRef} />
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+const DrawingCanvas = React.forwardRef<
     { clearCanvas: () => void }
 >((props, ref) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -321,6 +721,7 @@ const DrawingCanvas = React.memo(React.forwardRef<
           contextRef.current = context;
         }
         setCanvasDimensions();
+        // Optional: you can add a resize listener here if the canvas can change size
     }, []);
 
     useImperativeHandle(ref, () => ({
@@ -386,131 +787,79 @@ const DrawingCanvas = React.memo(React.forwardRef<
         onTouchMove={draw}
         className="w-full h-full bg-gray-900 cursor-crosshair" 
     />;
-}));
-
-// --- VIEW COMPONENTS ---
-
-const Dashboard: React.FC<{ 
-    levels: JlptLevel[], 
-    onSelectLevel: (level: JlptLevel) => void,
-    onSelectAlphabet: () => void,
-    onSpeakGuidance: (text: string) => void,
-    isSpeakingGuidance: boolean,
-    speakingGuidanceText: string | null
-}> = React.memo(({ levels, onSelectLevel, onSelectAlphabet, onSpeakGuidance, isSpeakingGuidance, speakingGuidanceText }) => {
-    const guidanceText = "Selamat datang di Nihongo Master. Pilih level untuk mulai belajar, atau mulailah dengan alfabet jika Anda baru. Level yang terkunci akan terbuka setelah Anda menyelesaikan level sebelumnya.";
-    const allCards = [ALPHABET_CARD, ...levels];
-    
-    return (
-        <>
-            <div className="flex justify-center items-center mb-8">
-                <h2 className="text-2xl font-semibold text-gray-300">Pilih Level Anda</h2>
-                <HelpButton 
-                    guidanceText={guidanceText}
-                    onSpeak={onSpeakGuidance}
-                    isSpeaking={isSpeakingGuidance}
-                    speakingText={speakingGuidanceText}
-                />
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
-                {allCards.map(level => (
-                    <div key={level.id}
-                        onClick={() => level.id === 'ALPHABET' ? onSelectAlphabet() : onSelectLevel(level)}
-                        className={`group relative rounded-2xl p-6 border border-white/10 bg-gray-800/50 backdrop-blur-sm shadow-2xl transition-all duration-300 ease-in-out transform hover:-translate-y-2 ${level.unlocked ? 'cursor-pointer hover:border-pink-400/50 hover:shadow-lg hover:shadow-pink-500/25' : 'cursor-not-allowed'}`}
-                    >
-                        {!level.unlocked && <div className="absolute inset-0 bg-black/60 rounded-2xl flex items-center justify-center z-10"><Lock className="w-10 h-10 text-gray-500"/></div>}
-                        <div className="flex justify-between items-start">
-                            <div className={`text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-br from-gray-200 to-gray-500 ${level.unlocked && 'group-hover:from-pink-400 group-hover:to-purple-500'}`}>{level.name}</div>
-                            <div className="text-purple-400">{level.icon}</div>
-                        </div>
-                        <h3 className="mt-4 text-xl font-semibold text-white">{level.title}</h3>
-                        <p className="mt-1 text-sm text-gray-400 h-10">{level.description}</p>
-                        <div className="mt-4 space-y-2 text-xs text-gray-300">
-                           {level.id !== 'ALPHABET' ? (
-                                <>
-                                    <p>Kanji: ~{level.kanjiCount}</p>
-                                    <p>Kosakata: ~{level.vocabCount}</p>
-                                </>
-                           ) : (
-                                <p>Total Karakter: {level.vocabCount}</p>
-                           )}
-                        </div>
-                        <div className="w-full bg-gray-700 rounded-full h-2.5 mt-6">
-                            <div className="bg-gradient-to-r from-pink-500 to-purple-600 h-2.5 rounded-full" style={{ width: `${level.progress}%` }}></div>
-                        </div>
-                    </div>
-                ))}
-            </div>
-        </>
-    )
 });
 
-const AlphabetView: React.FC<{
-    onBack: () => void;
+
+interface ContentGridProps {
+    items: string[];
+    onSelect: (item: string) => void;
     onSpeak: (text: string) => void;
     isSpeaking: boolean;
     speakingText: string | null;
-    onStartPractice: (character: string) => void;
-    onSpeakGuidance: (text: string) => void;
-    isSpeakingGuidance: boolean;
-    speakingGuidanceText: string | null;
-}> = React.memo(({ onBack, onSpeak, isSpeaking, speakingText, onStartPractice, onSpeakGuidance, isSpeakingGuidance, speakingGuidanceText }) => {
-    const [activeTab, setActiveTab] = useState('Hiragana');
-    const tabs = ['Hiragana', 'Katakana'];
-    const alphabetGuidanceText = "Ini adalah halaman untuk belajar alfabet Jepang. Pilih antara Hiragana atau Katakana, lalu klik sebuah karakter untuk berlatih menulisnya, atau klik ikon speaker untuk mendengar suaranya.";
-    const tabGuidance = {
-        Hiragana: "Hiragana digunakan untuk kata-kata asli Jepang, partikel tata bahasa, dan akhiran kata kerja. Ini adalah sistem penulisan pertama yang harus dipelajari.",
-        Katakana: "Katakana digunakan untuk kata-kata serapan dari bahasa asing, nama asing, dan untuk penekanan. Karakternya lebih bersudut daripada Hiragana."
-    };
+}
 
+const ContentGrid: React.FC<ContentGridProps> = ({items, onSelect, onSpeak, isSpeaking, speakingText}) => (
+    <div className="grid grid-cols-5 sm:grid-cols-8 md:grid-cols-10 gap-3">
+        {items.map((item, i) => {
+            const isCurrentlySpeaking = isSpeaking && speakingText === item;
+            return (
+                 <div key={i} className="relative group bg-gray-900 aspect-square rounded-lg transition-all duration-200 hover:bg-gray-700 focus-within:ring-2 focus-within:ring-purple-500 hover:-translate-y-1">
+                    <button 
+                        onClick={() => onSelect(item)} 
+                        aria-label={`Berlatih menulis ${item}`}
+                        className="w-full h-full flex items-center justify-center text-3xl sm:text-4xl font-bold"
+                    >
+                        {item}
+                    </button>
+                    <button
+                        onClick={(e) => { e.stopPropagation(); onSpeak(item); }}
+                        disabled={isSpeaking}
+                        aria-label={`Ucapkan ${item}`}
+                        className="absolute bottom-1 right-1 text-gray-500 hover:text-white p-1 rounded-full hover:bg-gray-800/50 transition-all opacity-50 group-hover:opacity-100 focus:opacity-100 disabled:opacity-50 disabled:cursor-wait"
+                    >
+                       {isCurrentlySpeaking ? <Spinner className="w-4 h-4" /> : <SpeakerIcon className="w-4 h-4"/>}
+                    </button>
+                </div>
+            )
+        })}
+    </div>
+);
+
+const ContentList: React.FC<{
+    items: string[];
+    onSpeak: (text: string) => void;
+    isSpeaking: boolean;
+    speakingText: string | null;
+}> = ({items, onSpeak, isSpeaking, speakingText}) => {
     return (
-        <div className="bg-gray-800/50 border border-white/10 rounded-2xl p-4 sm:p-8 shadow-2xl">
-            <button onClick={onBack} className="flex items-center gap-2 mb-6 text-gray-400 hover:text-white transition-colors">
-                <ChevronLeft /> Kembali ke Dasbor
-            </button>
-            <div className="flex items-center mb-6">
-                <h2 className="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-pink-400 to-purple-500">Dasar-Dasar Alfabet</h2>
-                <HelpButton 
-                    guidanceText={alphabetGuidanceText}
-                    onSpeak={onSpeakGuidance}
-                    isSpeaking={isSpeakingGuidance}
-                    speakingText={speakingGuidanceText}
-                />
-            </div>
-            
-            <div className="border-b border-gray-700">
-                <nav className="-mb-px flex space-x-8" aria-label="Tabs">
-                    {tabs.map(tab => (
-                        <button key={tab} onClick={() => setActiveTab(tab)}
-                            className={`${activeTab === tab ? 'border-purple-400 text-purple-400' : 'border-transparent text-gray-400 hover:text-gray-200 hover:border-gray-500'}
-                            whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition-colors`}>
-                            {tab}
-                        </button>
-                    ))}
-                </nav>
-            </div>
-
-            <div className="py-6 min-h-[400px]">
-                <TabContentHeader 
-                    title={activeTab} 
-                    guidanceText={tabGuidance[activeTab as keyof typeof tabGuidance]}
-                    onSpeakGuidance={onSpeakGuidance}
-                    isSpeakingGuidance={isSpeakingGuidance}
-                    speakingGuidanceText={speakingGuidanceText}
-                />
-                {activeTab === 'Hiragana' && <ContentGrid items={HIRAGANA_CHARS} onSelect={onStartPractice} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
-                {activeTab === 'Katakana' && <ContentGrid items={KATAKANA_CHARS} onSelect={onStartPractice} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
-            </div>
-        </div>
+     <ul className="space-y-3">
+        {items.map((item, i) => {
+             const isCurrentlySpeaking = isSpeaking && speakingText === item;
+             return (
+                 <li key={i} className="bg-gray-900 p-4 rounded-lg text-gray-300 flex justify-between items-center">
+                    <span>{item}</span>
+                    <button 
+                        onClick={() => onSpeak(item)}
+                        disabled={isSpeaking}
+                        aria-label={`Ucapkan ${item}`} 
+                        className="text-gray-400 hover:text-white p-2 rounded-full hover:bg-gray-700 transition-colors focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 disabled:cursor-wait"
+                    >
+                        {isCurrentlySpeaking ? <Spinner /> : <SpeakerIcon className="w-5 h-5"/>}
+                    </button>
+                </li>
+             )
+        })}
+    </ul>
     );
-});
+};
 
-const SentenceBuilder: React.FC<{ sentences: { ja: string; id: string }[] }> = React.memo(({ sentences }) => {
+const SentenceBuilder: React.FC<{ sentences: { ja: string; id: string }[] }> = ({ sentences }) => {
     const [currentIndex, setCurrentIndex] = useState(0);
     const [charBank, setCharBank] = useState<string[]>([]);
     const [userSentence, setUserSentence] = useState<string[]>([]);
     const [feedback, setFeedback] = useState<{ message: string; type: 'correct' | 'incorrect' | 'info' } | null>(null);
 
+    // Splits the sentence into individual characters.
     const splitSentenceToChars = (sentence: string) => sentence.split('');
 
     const setupSentence = useCallback((index: number) => {
@@ -609,7 +958,7 @@ const SentenceBuilder: React.FC<{ sentences: { ja: string; id: string }[] }> = R
                 ))}
             </div>
 
-            {feedback && <p className={`font-semibold ${feedback.type === 'correct' ? 'text-green-400 animate-tada' : 'text-red-400'}`}>{feedback.message}</p>}
+            {feedback && <p className={`font-semibold ${feedback.type === 'correct' ? 'text-green-400' : 'text-red-400'}`}>{feedback.message}</p>}
 
             <div className="flex gap-4 mt-4">
                 <button 
@@ -635,14 +984,17 @@ const SentenceBuilder: React.FC<{ sentences: { ja: string; id: string }[] }> = R
             </div>
         </div>
     );
-});
+};
 
-const EbookReader: React.FC<{
+
+interface EbookProps {
     content: EbookChapter[];
     onSpeak: (text: string) => void;
     isSpeaking: boolean;
     speakingText: string | null;
-}> = React.memo(({ content, onSpeak, isSpeaking, speakingText }) => {
+}
+
+const EbookReader: React.FC<EbookProps> = ({ content, onSpeak, isSpeaking, speakingText }) => {
     const [selectedChapter, setSelectedChapter] = useState(0);
 
     if (!content || content.length === 0) {
@@ -696,15 +1048,17 @@ const EbookReader: React.FC<{
             </article>
         </div>
     )
-});
+}
 
-const AiRoleplay: React.FC<{
+interface AiRoleplayProps {
     level: JlptLevel;
     scenarios: string[];
     onSpeak: (text: string) => void;
     isSpeaking: boolean;
     speakingText: string | null;
-}> = React.memo(({ level, scenarios, onSpeak, isSpeaking, speakingText }) => {
+}
+
+const AiRoleplay: React.FC<AiRoleplayProps> = ({ level, scenarios, onSpeak, isSpeaking, speakingText }) => {
     const [selectedScenario, setSelectedScenario] = useState(scenarios[0]);
     const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
     const [userInput, setUserInput] = useState('');
@@ -801,7 +1155,7 @@ const AiRoleplay: React.FC<{
                     type="text"
                     value={userInput}
                     onChange={(e) => setUserInput(e.target.value)}
-                    placeholder="Balas dalam bahasa Jepang atau Indonesia..."
+                    placeholder={`Balas dalam bahasa Jepang atau Indonesia...`}
                     className="flex-grow bg-gray-900 border border-gray-600 rounded-lg py-3 px-4 text-white focus:ring-purple-500 focus:border-purple-500 transition"
                 />
                 <button 
@@ -812,343 +1166,6 @@ const AiRoleplay: React.FC<{
                     Kirim
                 </button>
             </form>
-        </div>
-    );
-});
-
-const WritingPracticeView: React.FC<{
-    character: string;
-    onBack: () => void;
-    onSpeakGuidance: (text: string) => void;
-    isSpeakingGuidance: boolean;
-    speakingGuidanceText: string | null;
-}> = React.memo(({ character, onBack, onSpeakGuidance, isSpeakingGuidance, speakingGuidanceText }) => {
-    const canvasRef = useRef<{ clearCanvas: () => void }>(null);
-    const guidanceText = "Ini adalah mode latihan menulis. Lihat panduan urutan goresan di sebelah kiri. Gunakan mouse atau jari Anda untuk menulis karakter di kanvas sebelah kanan. Klik 'Bersihkan' untuk mencoba lagi.";
-    const strokeGuide = STROKE_ORDER_GUIDES[character];
-
-    return (
-        <div className="bg-gray-800/50 border border-white/10 rounded-2xl p-4 sm:p-8 shadow-2xl">
-            <button onClick={onBack} className="flex items-center gap-2 mb-6 text-gray-400 hover:text-white transition-colors">
-                <ChevronLeft /> Kembali ke Alfabet
-            </button>
-            <div className="flex items-center mb-6">
-                <h2 className="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-pink-400 to-purple-500">Latihan Menulis: {character}</h2>
-                <HelpButton
-                    guidanceText={guidanceText}
-                    onSpeak={onSpeakGuidance}
-                    isSpeaking={isSpeakingGuidance}
-                    speakingText={speakingGuidanceText}
-                />
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                <div>
-                    <h3 className="text-xl font-semibold mb-2 text-gray-300">Panduan Goresan</h3>
-                    <div className="aspect-square bg-gray-900 rounded-lg p-4 text-white">
-                        {strokeGuide ? strokeGuide : <p className="text-center text-gray-500 h-full flex items-center justify-center">Panduan untuk karakter ini belum tersedia.</p>}
-                    </div>
-                </div>
-                <div>
-                    <div className="flex justify-between items-center mb-2">
-                        <h3 className="text-xl font-semibold text-gray-300">Kanvas Latihan</h3>
-                        <button 
-                            onClick={() => canvasRef.current?.clearCanvas()}
-                            className="bg-gray-700 hover:bg-gray-600 text-white font-semibold px-4 py-1 rounded-lg transition-colors text-sm"
-                        >
-                            Bersihkan
-                        </button>
-                    </div>
-                    <div className="aspect-square rounded-lg overflow-hidden border-2 border-gray-700">
-                        <DrawingCanvas ref={canvasRef} />
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
-});
-
-interface LevelViewProps {
-    level: JlptLevel;
-    onBack: () => void;
-    onUnlockNextLevel: () => void;
-    onSpeak: (text: string) => void;
-    isSpeaking: boolean;
-    speakingText: string | null;
-    onSpeakGuidance: (text: string) => void;
-    isSpeakingGuidance: boolean;
-    speakingGuidanceText: string | null;
-}
-
-const LevelView: React.FC<LevelViewProps> = React.memo(({ 
-    level, 
-    onBack, 
-    onUnlockNextLevel, 
-    onSpeak, 
-    isSpeaking, 
-    speakingText,
-    onSpeakGuidance,
-    isSpeakingGuidance,
-    speakingGuidanceText 
-}) => {
-    const [activeTab, setActiveTab] = useState('Kanji');
-    const content = MOCK_CONTENT[level.id as keyof typeof MOCK_CONTENT] || MOCK_CONTENT.N4;
-    const ebookContent = MOCK_EBOOK_CONTENT[level.id as keyof typeof MOCK_EBOOK_CONTENT] || [];
-    const tabs = ['Kanji', 'Kosakata', 'Tata Bahasa', 'Susun Kalimat', 'E-Book', 'Latihan AI'];
-    
-    const levelGuidanceText = `Ini adalah halaman belajar untuk level ${level.name}. Jelajahi kanji, kosakata, tata bahasa, baca e-book, atau berlatih percakapan dengan AI menggunakan tab di bawah.`;
-    const tabGuidance = {
-        Kanji: "Di sini Anda dapat melihat dan mendengarkan pengucapan karakter Kanji untuk level ini. Klik pada sebuah karakter untuk mendengarnya.",
-        Kosakata: "Pelajari daftar kosakata penting untuk level ini. Klik ikon speaker untuk mendengarkan pengucapannya.",
-        'Tata Bahasa': "Pahami pola tata bahasa kunci yang akan Anda gunakan di level ini. Klik ikon speaker untuk mendengarkan contoh kalimat.",
-        'Susun Kalimat': "Latih pemahaman tata bahasa Anda. Baca arti kalimatnya, lalu klik kata-kata Jepang yang diacak untuk menyusunnya. Jika Anda kesulitan, gunakan tombol 'Minta Bantuan' untuk mendapatkan petunjuk kata berikutnya.",
-        'E-Book': "Baca materi pembelajaran mendalam. Pilih bab dari daftar isi di sebelah kiri untuk mulai membaca.",
-        'Latihan AI': "Berlatih percakapan dengan AI. Pilih skenario, mulai, dan balas pesannya dalam bahasa Jepang atau Indonesia."
-    };
-
-    return (
-        <div className="bg-gray-800/50 border border-white/10 rounded-2xl p-4 sm:p-8 shadow-2xl">
-            <button onClick={onBack} className="flex items-center gap-2 mb-6 text-gray-400 hover:text-white transition-colors">
-                <ChevronLeft /> Kembali ke Dasbor
-            </button>
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6">
-                <div>
-                    <div className="flex items-center">
-                        <h2 className="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-pink-400 to-purple-500">{level.name}: {level.title}</h2>
-                        <HelpButton 
-                            guidanceText={levelGuidanceText}
-                            onSpeak={onSpeakGuidance}
-                            isSpeaking={isSpeakingGuidance}
-                            speakingText={speakingGuidanceText}
-                        />
-                    </div>
-                    <p className="text-gray-400 mt-1">{level.description}</p>
-                </div>
-                 {level.progress < 100 && (
-                     <button onClick={onUnlockNextLevel} className="mt-4 md:mt-0 bg-gradient-to-r from-pink-500 to-purple-600 text-white font-semibold px-6 py-2 rounded-lg shadow-lg hover:scale-105 transition-transform">
-                         Ambil Tes Diagnostik
-                     </button>
-                 )}
-            </div>
-
-            <div className="border-b border-gray-700">
-                <nav className="-mb-px flex space-x-8 overflow-x-auto" aria-label="Tabs">
-                    {tabs.map(tab => (
-                        <button key={tab} onClick={() => setActiveTab(tab)}
-                            className={`${activeTab === tab ? 'border-purple-400 text-purple-400' : 'border-transparent text-gray-400 hover:text-gray-200 hover:border-gray-500'}
-                            whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm transition-colors`}>
-                            {tab}
-                        </button>
-                    ))}
-                </nav>
-            </div>
-
-            <div className="py-6 min-h-[400px]">
-                <TabContentHeader 
-                    title={activeTab} 
-                    guidanceText={tabGuidance[activeTab as keyof typeof tabGuidance]}
-                    onSpeakGuidance={onSpeakGuidance}
-                    isSpeakingGuidance={isSpeakingGuidance}
-                    speakingGuidanceText={speakingGuidanceText}
-                />
-                {activeTab === 'Kanji' && <ContentGrid items={content.kanji} onSelect={(item) => onSpeak(item)} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
-                {activeTab === 'Kosakata' && <ContentList items={content.vocab} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
-                {activeTab === 'Tata Bahasa' && <ContentList items={content.grammar} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
-                {activeTab === 'Susun Kalimat' && <SentenceBuilder sentences={content.sentences} />}
-                {activeTab === 'E-Book' && <EbookReader content={ebookContent} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
-                {activeTab === 'Latihan AI' && <AiRoleplay level={level} scenarios={content.scenarios} onSpeak={onSpeak} isSpeaking={isSpeaking} speakingText={speakingText} />}
-            </div>
-        </div>
-    );
-});
-
-// --- MAIN APP COMPONENT ---
-
-const App: React.FC = () => {
-    const [levels, setLevels] = useState<JlptLevel[]>(MOCK_LEVELS);
-    const [selectedLevel, setSelectedLevel] = useState<JlptLevel | null>(null);
-    const [viewingAlphabet, setViewingAlphabet] = useState(false);
-    const [practicingChar, setPracticingChar] = useState<string | null>(null);
-    const [isSpeakingContent, setIsSpeakingContent] = useState(false);
-    const [speakingContentText, setSpeakingContentText] = useState<string | null>(null);
-    const [isSpeakingGuidance, setIsSpeakingGuidance] = useState(false);
-    const [speakingGuidanceText, setSpeakingGuidanceText] = useState<string | null>(null);
-    const [isTransitioning, setIsTransitioning] = useState(false);
-    const audioContextRef = useRef<AudioContext | null>(null);
-    const transitionTimeoutRef = useRef<number | null>(null);
-
-    useEffect(() => {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-        return () => {
-          audioContextRef.current?.close();
-          if (transitionTimeoutRef.current) clearTimeout(transitionTimeoutRef.current);
-        }
-    }, []);
-
-    const speak = useCallback(async (text: string, isGuidance: boolean) => {
-        if ((isSpeakingContent || isSpeakingGuidance) || !text || !audioContextRef.current) return;
-
-        const audioContext = audioContextRef.current;
-        let textToSendToApi = text;
-
-        if (isGuidance) {
-            setIsSpeakingGuidance(true);
-            setSpeakingGuidanceText(text);
-        } else {
-            const cleanText = text.split('\n')[0].replace(/\s*\(.*?\)\s*/g, '').trim();
-            if (!cleanText) return;
-            textToSendToApi = cleanText.length === 1 ? `「${cleanText}」と読みます。` : cleanText;
-            setIsSpeakingContent(true);
-            setSpeakingContentText(text);
-        }
-
-        try {
-            const getAudio = isGuidance ? getIndonesianGuidanceAudio : getTextToSpeechAudio;
-            const base64Audio = await getAudio(textToSendToApi);
-            const binaryString = window.atob(base64Audio);
-            const bytes = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                bytes[i] = binaryString.charCodeAt(i);
-            }
-            const audioBuffer = await decodeRawAudioData(audioContext, bytes.buffer);
-            const source = audioContext.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(audioContext.destination);
-            source.start(0);
-            
-            source.onended = () => {
-               if (isGuidance) {
-                   setIsSpeakingGuidance(false);
-                   setSpeakingGuidanceText(null);
-               } else {
-                   setIsSpeakingContent(false);
-                   setSpeakingContentText(null);
-               }
-            };
-        } catch (error) {
-            console.error("Error playing audio:", error);
-            if (isGuidance) {
-                setIsSpeakingGuidance(false);
-                setSpeakingGuidanceText(null);
-            } else {
-                setIsSpeakingContent(false);
-                setSpeakingContentText(null);
-            }
-        }
-    }, [isSpeakingContent, isSpeakingGuidance]);
-
-    const speakContent = (text: string) => speak(text, false);
-    const speakGuidance = (text: string) => speak(text, true);
-
-    const performViewChange = (updateState: () => void) => {
-        if (transitionTimeoutRef.current) clearTimeout(transitionTimeoutRef.current);
-        setIsTransitioning(true);
-        transitionTimeoutRef.current = window.setTimeout(() => {
-            updateState();
-            setIsTransitioning(false);
-        }, 300); // Duration should match CSS transition
-    };
-
-    const handleSelectLevel = (level: JlptLevel) => {
-        if (level.unlocked) {
-            performViewChange(() => setSelectedLevel(level));
-        }
-    };
-
-    const handleSelectAlphabet = () => performViewChange(() => setViewingAlphabet(true));
-    const handleStartPractice = (char: string) => performViewChange(() => setPracticingChar(char));
-    
-    const handleBack = () => {
-        performViewChange(() => {
-            setSelectedLevel(null);
-            setViewingAlphabet(false);
-            setPracticingChar(null);
-        });
-    };
-    
-    const handleBackToAlphabet = () => performViewChange(() => setPracticingChar(null));
-
-    const handleUnlockNextLevel = () => {
-        const currentIndex = levels.findIndex(l => l.id === selectedLevel?.id);
-        if (currentIndex !== -1 && currentIndex < levels.length - 1) {
-            const nextLevelIndex = currentIndex + 1;
-            if (!levels[nextLevelIndex].unlocked) {
-                const updatedLevels = [...levels];
-                updatedLevels[nextLevelIndex].unlocked = true;
-                updatedLevels[currentIndex].progress = 100;
-                setLevels(updatedLevels);
-                alert(`${levels[nextLevelIndex].name} Terbuka!`);
-            }
-        }
-    };
-
-    const renderContent = () => {
-        if (practicingChar) {
-            return <WritingPracticeView
-                character={practicingChar}
-                onBack={handleBackToAlphabet}
-                onSpeakGuidance={speakGuidance}
-                isSpeakingGuidance={isSpeakingGuidance}
-                speakingGuidanceText={speakingGuidanceText}
-            />
-        }
-        if (viewingAlphabet) {
-            return <AlphabetView 
-                onBack={handleBack}
-                onSpeak={speakContent}
-                isSpeaking={isSpeakingContent}
-                speakingText={speakingContentText}
-                onStartPractice={handleStartPractice}
-                onSpeakGuidance={speakGuidance}
-                isSpeakingGuidance={isSpeakingGuidance}
-                speakingGuidanceText={speakingGuidanceText}
-            />;
-        }
-        if (selectedLevel) {
-            return <LevelView 
-                level={selectedLevel} 
-                onBack={handleBack}
-                onUnlockNextLevel={handleUnlockNextLevel}
-                onSpeak={speakContent}
-                isSpeaking={isSpeakingContent}
-                speakingText={speakingContentText}
-                onSpeakGuidance={speakGuidance}
-                isSpeakingGuidance={isSpeakingGuidance}
-                speakingGuidanceText={speakingGuidanceText}
-            />;
-        }
-        return <Dashboard 
-            levels={levels} 
-            onSelectLevel={handleSelectLevel}
-            onSelectAlphabet={handleSelectAlphabet}
-            onSpeakGuidance={speakGuidance}
-            isSpeakingGuidance={isSpeakingGuidance}
-            speakingGuidanceText={speakingGuidanceText}
-        />;
-    };
-
-    return (
-        <div className="min-h-screen bg-gray-900 text-gray-100 font-sans p-4 sm:p-6 lg:p-8">
-            <svg width="0" height="0" style={{position: 'absolute'}}>
-                <defs>
-                    <marker id="arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="3" markerHeight="3" orient="auto-start-reverse">
-                        <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
-                    </marker>
-                </defs>
-            </svg>
-            <main className="max-w-7xl mx-auto">
-                <header className="text-center mb-12">
-                    <div className="flex justify-center items-center gap-4">
-                        <Bot className="w-10 h-10 sm:w-12 sm:h-12 text-purple-400" />
-                        <h1 className="text-4xl sm:text-5xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-pink-400 to-purple-500">
-                            Nihongo Master
-                        </h1>
-                    </div>
-                    <p className="mt-2 text-md sm:text-lg text-gray-400">Perjalanan Anda menuju kefasihan berbahasa Jepang dengan dukungan AI.</p>
-                </header>
-                <div className={`transition-opacity duration-300 ${isTransitioning ? 'opacity-0' : 'opacity-100'}`}>
-                    {renderContent()}
-                </div>
-            </main>
         </div>
     );
 };
